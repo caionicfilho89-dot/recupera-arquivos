@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QH
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import carver  # noqa: E402
+import ntfs  # noqa: E402
 from carver import SPECS  # noqa: E402
 
 
@@ -84,13 +85,13 @@ def app_icon():
     return QIcon(pm)
 
 
-class CarveTask(QThread):
+class Task(QThread):
     progress = pyqtSignal(int, int)
     done = pyqtSignal(object, str)
 
-    def __init__(self, source, out_dir, types, parent=None):
+    def __init__(self, worker, parent=None):
         super().__init__(parent)
-        self.source, self.out_dir, self.types = source, out_dir, types
+        self.worker = worker
         self._stop = False
 
     def stop(self):
@@ -98,9 +99,7 @@ class CarveTask(QThread):
 
     def run(self):
         try:
-            rec = carver.carve(self.source, self.out_dir, self.types,
-                               progress=lambda a, b: self.progress.emit(a, b),
-                               should_stop=lambda: self._stop)
+            rec = self.worker(lambda a, b: self.progress.emit(a, b), lambda: self._stop)
             self.done.emit(rec, "")
         except PermissionError:
             self.done.emit([], "admin")
@@ -128,6 +127,16 @@ class Recupera(QWidget):
         self.admin_lbl.setWordWrap(True)
         root.addWidget(self.admin_lbl)
 
+        # modo
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Modo:"))
+        self.mode = QComboBox()
+        self.mode.addItem("Por conteúdo (carving) — acha por tipo, em qualquer disco", "carving")
+        self.mode.addItem("NTFS — recupera COM o nome (só partição NTFS)", "ntfs")
+        self.mode.activated.connect(self.on_mode)
+        mrow.addWidget(self.mode, 1)
+        root.addLayout(mrow)
+
         # origem
         orow = QHBoxLayout()
         orow.addWidget(QLabel("Onde procurar:"))
@@ -152,7 +161,8 @@ class Recupera(QWidget):
 
         # tipos
         trow = QHBoxLayout()
-        trow.addWidget(QLabel("Tipos:"))
+        self.types_lbl = QLabel("Tipos:")
+        trow.addWidget(self.types_lbl)
         self.checks = {}
         for key, spec in SPECS.items():
             cb = QCheckBox(spec["label"])
@@ -200,6 +210,13 @@ class Recupera(QWidget):
         root.addLayout(brow)
 
         self.refresh_admin()
+        self.on_mode()
+
+    def on_mode(self):
+        ntfs_mode = self.mode.currentData() == "ntfs"
+        self.types_lbl.setEnabled(not ntfs_mode)
+        for cb in self.checks.values():
+            cb.setEnabled(not ntfs_mode)
 
     def refresh_admin(self):
         if is_admin():
@@ -252,9 +269,14 @@ class Recupera(QWidget):
             return self.msg("A pasta de saída está no MESMO disco de onde você quer recuperar.\n\n"
                             "Isso pode sobregravar justamente o que você tenta salvar. Escolha uma pasta "
                             "em outro disco (outro pendrive, HD externo, etc.).")
-        types = [k for k, cb in self.checks.items() if cb.isChecked()]
-        if not types:
-            return self.msg("Marque pelo menos um tipo de arquivo.")
+        src, out = self.source, self.out_dir
+        if self.mode.currentData() == "ntfs":
+            worker = lambda prog, stop: ntfs.scan_ntfs(src, out, progress=prog, should_stop=stop)  # noqa: E731
+        else:
+            types = [k for k, cb in self.checks.items() if cb.isChecked()]
+            if not types:
+                return self.msg("Marque pelo menos um tipo de arquivo.")
+            worker = lambda prog, stop: carver.carve(src, out, types, progress=prog, should_stop=stop)  # noqa: E731
 
         self.results.clear()
         self.prog.show()
@@ -264,7 +286,7 @@ class Recupera(QWidget):
         self.open_btn.setEnabled(False)
         self.status.setStyleSheet("color:#8a93a8;")
         self.status.setText("Varrendo o disco em busca de arquivos… (quanto maior, mais demora)")
-        self.task = CarveTask(self.source, self.out_dir, types, self)
+        self.task = Task(worker, self)
         self.task.progress.connect(self.on_progress)
         self.task.done.connect(self.on_done)
         self.task.start()
@@ -295,7 +317,11 @@ class Recupera(QWidget):
         self.status.setText(f"✓ Recuperei {len(rec)} arquivo(s) ({human(total)}) em: {self.out_dir}")
         self.open_btn.setEnabled(bool(rec))
         for r in rec:
-            it = QTreeWidgetItem([SPECS[r["kind"]]["label"], human(r["size"]), os.path.basename(r["path"])])
+            if "kind" in r:   # carving
+                col0, nome = SPECS[r["kind"]]["label"], os.path.basename(r["path"])
+            else:             # ntfs
+                col0, nome = ("resident" if r.get("resident") else "non-resident"), r["name"]
+            it = QTreeWidgetItem([col0, human(r["size"]), nome])
             it.setData(0, Qt.ItemDataRole.UserRole, r["path"])
             it.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.results.addTopLevelItem(it)
