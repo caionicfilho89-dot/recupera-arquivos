@@ -1,0 +1,9 @@
+# cache do Python
+__pycache__/
+*.pyc
+
+# arquivos recuperados / imagens de teste
+recuperados/
+*.img
+*.dd
+*.raw
